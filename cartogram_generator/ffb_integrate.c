@@ -20,7 +20,7 @@ fftw_plan plan_grid_fluxx_init, plan_grid_fluxy_init;
 /**************************** Function prototypes. ***************************/
 
 void init_gridv (void);
-void calcv (double t);
+void ffb_calcv (double t);
 
 /*****************************************************************************/
 /* Function to initialize the Fourier transforms of gridvx[] and gridvy[] at */
@@ -79,7 +79,7 @@ void init_gridv (void)
 /* Function to calculate the velocity at the grid points (x, y) with x =     */
 /* 0.5, 1.5, ..., lx-0.5 and y = 0.5, 1.5, ..., ly-0.5 at time t.            */
 
-void calcv (double t)
+void ffb_calcv (double t)
 {
   double rho;
   int k;
@@ -175,14 +175,15 @@ double interpol (double x, double y, double *grid, char *zero)
 }
 
 /*****************************************************************************/
-/*************** Function to integrate the equations of motion. **************/
+/* Function to integrate the equations of motion with the fast flow-based    */
+/* method.                                                                   */
 
-void integrate (void)
+void ffb_integrate (void)
 {
   BOOLEAN accept;
-  double delta_t, t, *vx_intp, *vx_intp_half, *vy_intp, *vy_intp_half,
-    *xeul, *xmid, *yeul, *ymid;
+  double delta_t, t, *vx_intp, *vx_intp_half, *vy_intp, *vy_intp_half;
   int iter, k;
+  POINT *eul, *mid;
   
   /****************** Allocate memory for the velocity grid. *****************/
   
@@ -202,28 +203,25 @@ void integrate (void)
     fftw_plan_r2r_2d(lx, ly, grid_fluxy_init, grid_fluxy_init,
 		     FFTW_REDFT01, FFTW_RODFT01, FFTW_ESTIMATE);
   
-  /* xeul[i*ly+j] and yeul[i*ly+j] will be the new displacement proposed by  */
-  /* a simple Euler step: move a full time interval delta_t with the         */
-  /* velocity at time t and position (i + 0.5 + xdisp[i*ly+j],               */
-  /* j + 0.5 + xdisp[i*ly+j]).                                               */
+  /* eul[i*ly+j] will be the new position of proj[i*ly+j] proposed by a      */
+  /* simple Euler step: move a full time interval delta_t with the velocity  */
+  /* at time t and position (proj[i*ly+j].x, proj[i*ly+j].y).                */
   
-  xeul = (double*) malloc(lx * ly * sizeof(double));
-  yeul = (double*) malloc(lx * ly * sizeof(double));
+  eul = (POINT*) malloc(lx * ly * sizeof(POINT));
   
-  /* xmid[i*ly+j] and yeul[i*ly+j] will be the new displacement proposed by  */
-  /* the midpoint method (see comment below for the formula).                */
+  /* mid[i*ly+j] will be the new displacement proposed by the midpoint       */
+  /* method (see comment below for the formula).                             */
   
-  xmid = (double*) malloc(lx * ly * sizeof(double));
-  ymid = (double*) malloc(lx * ly * sizeof(double));
+  mid = (POINT*) malloc(lx * ly * sizeof(POINT));
   
-  /* (vx_intp, vy_intp) will be the velocity at position (xproj, yproj) at   */
+  /* (vx_intp, vy_intp) will be the velocity at position (proj.x, proj.y) at */
   /* time t.                                                                 */
   
   vx_intp = (double*) malloc(lx * ly * sizeof(double));
   vy_intp = (double*) malloc(lx * ly * sizeof(double));
   
   /* (vx_intp_half, vy_intp_half) will be the velocity at the midpoint       */
-  /* (xproj + 0.5*delta_t*vx_intp, yproj + 0.5*delta_t*vy_intp) at time      */
+  /* (proj.x + 0.5*delta_t*vx_intp, proj.y + 0.5*delta_t*vy_intp) at time    */
   /* t + 0.5*delta_t.                                                        */
   
   vx_intp_half = (double*) malloc(lx * ly * sizeof(double));
@@ -233,23 +231,23 @@ void integrate (void)
   
   init_gridv();
   t = 0.0;
-  delta_t = 1e-2;
+  delta_t = 1e-2;                                      /* Initial time step. */
   iter = 0;
   
   /******************************** Integrate. *******************************/
   
   do {
-    calcv(t);
+    ffb_calcv(t);
 #pragma omp parallel for
     for (k=0; k<lx*ly; k++) {
       
       /* We know, either because of the initialization or because of the     */
-      /* check at the end of the last iteration, that (xproj[k], yproj[k])   */
+      /* check at the end of the last iteration, that (proj.x[k], proj.y[k]) */
       /* is inside the rectangle [0, lx] x [0, ly]. This fact guarantees     */
       /* that interpol() is given a point that cannot cause it to fail.      */
       
-      vx_intp[k] = interpol(xproj[k], yproj[k], gridvx, "x");
-      vy_intp[k] = interpol(xproj[k], yproj[k], gridvy, "y");
+      vx_intp[k] = interpol(proj[k].x, proj[k].y, gridvx, "x");
+      vy_intp[k] = interpol(proj[k].x, proj[k].y, gridvy, "y");
     }
     accept = FALSE;
     while (!accept) {
@@ -258,8 +256,8 @@ void integrate (void)
       
 #pragma omp parallel for
       for (k=0; k<lx*ly; k++) {
-      	xeul[k] = xproj[k] + vx_intp[k] * delta_t;
-      	yeul[k] = yproj[k] + vy_intp[k] * delta_t;
+      	eul[k].x = proj[k].x + vx_intp[k] * delta_t;
+      	eul[k].y = proj[k].y + vy_intp[k] * delta_t;
       }
       
       /* Use "explicit midpoint method".                                     */
@@ -268,43 +266,46 @@ void integrate (void)
       /*                        t + 0.5*delta_t)                             */
       /* and similarly for y.                                                */
       
-      calcv(t + 0.5*delta_t);
+      ffb_calcv(t + 0.5*delta_t);
       
       /* Make sure we do not pass a point outside [0, lx] x [0, ly] to       */
-      /* interpol(). Otherwise we decrease the time step further down and    */
-      /* try again.                                                          */
+      /* interpol(). Otherwise decrease the time step below and try again.   */
       
       accept = TRUE;
       for (k=0; k<lx*ly; k++)
-      	if (xproj[k] + 0.5*delta_t*vx_intp[k] < 0.0 ||
-      	    xproj[k] + 0.5*delta_t*vx_intp[k] > lx ||
-      	    yproj[k] + 0.5*delta_t*vy_intp[k] < 0.0 ||
-      	    yproj[k] + 0.5*delta_t*vy_intp[k] > ly)
+      	if (proj[k].x + 0.5*delta_t*vx_intp[k] < 0.0 ||
+      	    proj[k].x + 0.5*delta_t*vx_intp[k] > lx ||
+      	    proj[k].y + 0.5*delta_t*vy_intp[k] < 0.0 ||
+      	    proj[k].y + 0.5*delta_t*vy_intp[k] > ly) {
       	  accept = FALSE;
+	  delta_t *= DEC_AFTER_NOT_ACC;
+	  break;
+	}
       if (accept) {
 	
       	/* OK, we can run interpol(). */
 	
 #pragma omp parallel for
       	for (k=0; k<lx*ly; k++) {
-      	  vx_intp_half[k] = interpol(xproj[k] + 0.5*delta_t*vx_intp[k],
-				     yproj[k] + 0.5*delta_t*vy_intp[k],
+      	  vx_intp_half[k] = interpol(proj[k].x + 0.5*delta_t*vx_intp[k],
+				     proj[k].y + 0.5*delta_t*vy_intp[k],
 				     gridvx, "x");
-      	  vy_intp_half[k] = interpol(xproj[k] + 0.5*delta_t*vx_intp[k],
-				     yproj[k] + 0.5*delta_t*vy_intp[k],
+      	  vy_intp_half[k] = interpol(proj[k].x + 0.5*delta_t*vx_intp[k],
+				     proj[k].y + 0.5*delta_t*vy_intp[k],
 				     gridvy, "y");
-      	  xmid[k] = xproj[k] + vx_intp_half[k] * delta_t;
-      	  ymid[k] = yproj[k] + vy_intp_half[k] * delta_t;
+      	  mid[k].x = proj[k].x + vx_intp_half[k] * delta_t;
+      	  mid[k].y = proj[k].y + vy_intp_half[k] * delta_t;
 	  
-      	  /* Do not accept the integration step if the maximum distance      */
-      	  /* between the Euler and midpoint proposals exceeds ABS_TOL.       */
-      	  /* Neither should we accept the integration step if one of these   */
-      	  /* positions wandered out of the boundaries. If it happened,       */
-      	  /* decrease the time step.                                         */
+      	  /* Do not accept the integration step if the maximum squared       */
+	  /* difference between the Euler and midpoint proposals exceeds     */
+	  /* ABS_TOL. Neither should we accept the integration step if one   */
+	  /* of the positions wandered out of the boundaries. If it          */
+      	  /* happened, decrease the time step.                               */
 	  
-      	  if ((xmid[k]-xeul[k]) * (xmid[k]-xeul[k]) +
-	      (ymid[k]-yeul[k]) * (ymid[k]-yeul[k]) > ABS_TOL ||
-	      xmid[k] < 0.0 || xmid[k] > lx || ymid[k] < 0.0 || ymid[k] > ly)
+      	  if ((mid[k].x-eul[k].x) * (mid[k].x-eul[k].x) +
+	      (mid[k].y-eul[k].y) * (mid[k].y-eul[k].y) > ABS_TOL ||
+	      mid[k].x < 0.0 || mid[k].x > lx ||
+	      mid[k].y < 0.0 || mid[k].y > ly)
       	    accept = FALSE;
         }
       }
@@ -322,8 +323,8 @@ void integrate (void)
     t += delta_t;
     iter++;
     for (k=0; k<lx*ly; k++) {
-      xproj[k] = xmid[k];
-      yproj[k] = ymid[k];
+      proj[k].x = mid[k].x;
+      proj[k].y = mid[k].y;
     }
     delta_t *= INC_AFTER_ACC;           /* Try a larger step size next time. */
     
@@ -337,10 +338,8 @@ void integrate (void)
   free(gridvy);
   fftw_free(grid_fluxx_init);
   fftw_free(grid_fluxy_init);
-  free(xeul);
-  free(yeul);
-  free(xmid);
-  free(ymid);
+  free(eul);
+  free(mid);
   free(vx_intp);
   free(vy_intp);
   free(vx_intp_half);
